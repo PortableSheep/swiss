@@ -106,6 +106,11 @@ const GitPlugin: React.FC<PluginProps> = ({ suppressQuit }) => {
     backMode: 'STATUS'
   });
 
+  // Sync status indicators
+  const [ahead, setAhead] = useState<number | null>(null);
+  const [behind, setBehind] = useState<number | null>(null);
+  const [hasUpstream, setHasUpstream] = useState(false);
+
   // Enable full interactive scrolling support across panels
   useMouse((event) => {
     if (loading) return;
@@ -161,8 +166,36 @@ const GitPlugin: React.FC<PluginProps> = ({ suppressQuit }) => {
         return;
       }
 
+      // Quick background fetch with 3-second timeout so offline flow is unaffected
+      try {
+        await execa('git', ['fetch', '--prune'], { timeout: 3000 });
+      } catch {}
+
       const { stdout: branchOut } = await execa('git', ['branch', '--show-current']);
-      setBranch(branchOut.trim());
+      const currentBranch = branchOut.trim();
+      setBranch(currentBranch);
+
+      // Check if upstream tracking branch exists
+      let trackingUpstream = false;
+      let aheadCount = 0;
+      let behindCount = 0;
+      try {
+        await execa('git', ['rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{u}']);
+        trackingUpstream = true;
+
+        // Fetch ahead/behind counts
+        const { stdout: countsOut } = await execa('git', ['rev-list', '--left-right', '--count', 'HEAD...@{u}']);
+        const counts = countsOut.trim().split(/\s+/);
+        if (counts.length === 2) {
+          aheadCount = parseInt(counts[0], 10) || 0;
+          behindCount = parseInt(counts[1], 10) || 0;
+        }
+      } catch (e) {
+        trackingUpstream = false;
+      }
+      setHasUpstream(trackingUpstream);
+      setAhead(aheadCount);
+      setBehind(behindCount);
 
       const { stdout: statusOut } = await execa('git', ['status', '--porcelain']);
       const parsedFiles: GitFile[] = statusOut.split('\n').filter(Boolean).map(line => {
@@ -405,13 +438,67 @@ const GitPlugin: React.FC<PluginProps> = ({ suppressQuit }) => {
       }
       if (input === 'P') {
         setLoading(true);
-        await execa('git', ['push']);
-        await refreshStatus();
+        try {
+          let hasTracking = false;
+          try {
+            await execa('git', ['rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{u}']);
+            hasTracking = true;
+          } catch {}
+
+          if (hasTracking) {
+            await execa('git', ['push']);
+          } else {
+            const { stdout: remoteOut } = await execa('git', ['remote']);
+            const remotes = remoteOut.split('\n').filter(Boolean);
+            if (remotes.length > 0) {
+              const primaryRemote = remotes[0];
+              const { stdout: branchOut } = await execa('git', ['branch', '--show-current']);
+              const currentBranch = branchOut.trim();
+              
+              await execa('git', ['push', '--set-upstream', primaryRemote, currentBranch]);
+            } else {
+              throw new Error('No remote configured. Please add a git remote (e.g. git remote add origin <url>) before pushing.');
+            }
+          }
+          await refreshStatus();
+        } catch (err: any) {
+          setError(err.message);
+        } finally {
+          setLoading(false);
+        }
       }
       if (input === 'p') {
         setLoading(true);
-        await execa('git', ['pull']);
-        await refreshStatus();
+        try {
+          let hasTracking = false;
+          try {
+            await execa('git', ['rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{u}']);
+            hasTracking = true;
+          } catch {}
+
+          if (hasTracking) {
+            await execa('git', ['pull']);
+          } else {
+            const { stdout: remoteOut } = await execa('git', ['remote']);
+            const remotes = remoteOut.split('\n').filter(Boolean);
+            if (remotes.length > 0) {
+              const primaryRemote = remotes[0];
+              const { stdout: branchOut } = await execa('git', ['branch', '--show-current']);
+              const currentBranch = branchOut.trim();
+              
+              await execa('git', ['pull', primaryRemote, currentBranch]);
+              // Also establish tracking so future pulls/pushes work out of the box!
+              await execa('git', ['branch', `--set-upstream-to=${primaryRemote}/${currentBranch}`, currentBranch]);
+            } else {
+              throw new Error('No remote configured. Cannot pull.');
+            }
+          }
+          await refreshStatus();
+        } catch (err: any) {
+          setError(err.message);
+        } finally {
+          setLoading(false);
+        }
       }
     } else if (mode === 'DIFF') {
       if (key.downArrow && diffLines.length > 0) {
@@ -667,9 +754,27 @@ const GitPlugin: React.FC<PluginProps> = ({ suppressQuit }) => {
     );
   }
 
+  let syncInfo = '';
+  if (!hasUpstream) {
+    syncInfo = ' | ⚠️ No upstream tracking';
+  } else {
+    const parts: string[] = [];
+    if (ahead && ahead > 0) {
+      parts.push(`⇡ ${ahead} ahead`);
+    }
+    if (behind && behind > 0) {
+      parts.push(`⇣ ${behind} behind`);
+    }
+    if (parts.length > 0) {
+      syncInfo = ` | ${parts.join(', ')}`;
+    } else {
+      syncInfo = ' | ✓ Up to date';
+    }
+  }
+
   return (
     <Layout>
-      <Header title={`Git [Branch: ${branch}]`} />
+      <Header title={`Git [Branch: ${branch}]${syncInfo}`} />
 
       {mode === 'STATUS' && (
         <>
