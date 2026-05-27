@@ -2,7 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { Text, Box, useInput } from 'ink';
 import fetch from 'node-fetch';
 import { execa } from 'execa';
-import { Header, Layout, Card, ScrollableList, Footer, StatusBadge, useTerminalSize, TextInputField } from '../components/UI.js';
+import { Header, Layout, Card, ScrollableList, Footer, StatusBadge, useTerminalSize } from '../components/UI.js';
 import { PluginProps } from '../core/types.js';
 
 export const name = 'PR';
@@ -18,13 +18,11 @@ interface PullRequest {
   status: 'pending' | 'approved' | 'changes_requested';
   ciStatus: 'passing' | 'running' | 'failing';
   url: string;
+  repoName?: string;
 }
 
 const PRPlugin: React.FC<PluginProps> = ({ config }) => {
   const size = useTerminalSize();
-  const [repo, setRepo] = useState('');
-  const [mode, setMode] = useState<'VIEW' | 'EDIT_REPO'>('VIEW');
-  const [inputRepo, setInputRepo] = useState('');
   const maxVisibleList = Math.max(4, size.rows - (config.githubToken ? 10 : 13));
   const [myPRs, setMyPRs] = useState<PullRequest[]>([]);
   const [teamPRs, setTeamPRs] = useState<PullRequest[]>([]);
@@ -32,38 +30,6 @@ const PRPlugin: React.FC<PluginProps> = ({ config }) => {
   const [error, setError] = useState<string | null>(null);
   const [isLive, setIsLive] = useState(false);
   const [selectedIndex, setSelectedIndex] = useState(0);
-  const [gitError, setGitError] = useState<string | null>(null);
-
-  const detectRepo = async () => {
-    try {
-      // First verify if inside a git repository
-      try {
-        await execa('git', ['rev-parse', '--is-inside-work-tree']);
-      } catch (e) {
-        throw new Error('Not a git repository (or any of the parent directories)');
-      }
-
-      let stdout;
-      try {
-        const res = await execa('git', ['config', '--get', 'remote.origin.url']);
-        stdout = res.stdout;
-      } catch (e) {
-        throw new Error('No remote origin URL found');
-      }
-
-      const url = stdout.trim();
-      const match = url.match(/github\.com[:/]([^/]+\/[^.]+)/);
-      if (match && match[1]) {
-        return match[1].replace(/\.git$/, '');
-      } else {
-        throw new Error('No GitHub remote origin found');
-      }
-    } catch (err: any) {
-      setGitError(err.message);
-      setLoading(false);
-      throw err;
-    }
-  };
 
   const fetchData = async () => {
     setLoading(true);
@@ -88,59 +54,84 @@ const PRPlugin: React.FC<PluginProps> = ({ config }) => {
         const userData: any = await userRes.json();
         const username = userData.login;
 
-        // Fetch open pull requests
-        const pullsRes = await fetch(`https://api.github.com/repos/${repo}/pulls?state=open`, { headers });
-        if (!pullsRes.ok) {
-          throw new Error(`Fetch PRs failed (${pullsRes.status}): ${pullsRes.statusText}`);
+        // Fetch open pull requests created by the user across all of GitHub
+        const mineRes = await fetch(`https://api.github.com/search/issues?q=is:open+is:pr+author:${username}`, { headers });
+        if (!mineRes.ok) {
+          throw new Error(`Fetch My PRs failed (${mineRes.status}): ${mineRes.statusText}`);
         }
-        const pulls: any = await pullsRes.json();
+        const mineData: any = await mineRes.json();
+        const minePulls = (mineData.items || []).slice(0, 15);
 
-        if (!Array.isArray(pulls)) {
-          throw new Error('Unexpected GitHub response format: expected list of pull requests');
+        // Fetch open pull requests requesting the user's review across all of GitHub
+        const teamRes = await fetch(`https://api.github.com/search/issues?q=is:open+is:pr+review-requested:${username}`, { headers });
+        if (!teamRes.ok) {
+          throw new Error(`Fetch Team PRs failed (${teamRes.status}): ${teamRes.statusText}`);
         }
+        const teamData: any = await teamRes.json();
+        const teamPulls = (teamData.items || []).slice(0, 15);
 
-        const formatted: PullRequest[] = await Promise.all(pulls.map(async (pr: any) => {
-          let ciStatus: PullRequest['ciStatus'] = 'passing';
-          try {
-            const statusRes = await fetch(`https://api.github.com/repos/${repo}/commits/${pr.head.sha}/status`, { headers });
-            if (statusRes.ok) {
-              const statusData: any = await statusRes.json();
-              if (statusData.state === 'failure' || statusData.state === 'error') {
-                ciStatus = 'failing';
-              } else if (statusData.state === 'pending') {
-                ciStatus = 'running';
-              }
+        const formatPRList = async (pulls: any[]) => {
+          return await Promise.all(pulls.map(async (pr: any) => {
+            let ciStatus: PullRequest['ciStatus'] = 'passing';
+            let reviewStatus: PullRequest['status'] = 'pending';
+            
+            // Extract repo owner/name from repository_url
+            const match = pr.repository_url.match(/api\.github\.com\/repos\/([^/]+\/[^/]+)/);
+            const repoName = match ? match[1] : '';
+
+            if (repoName) {
+              try {
+                // Fetch PR detail to get head.sha
+                const detailRes = await fetch(`https://api.github.com/repos/${repoName}/pulls/${pr.number}`, { headers });
+                if (detailRes.ok) {
+                  const prDetail: any = await detailRes.json();
+                  const headSha = prDetail.head?.sha;
+                  
+                  if (headSha) {
+                    const statusRes = await fetch(`https://api.github.com/repos/${repoName}/commits/${headSha}/status`, { headers });
+                    if (statusRes.ok) {
+                      const statusData: any = await statusRes.json();
+                      if (statusData.state === 'failure' || statusData.state === 'error') {
+                        ciStatus = 'failing';
+                      } else if (statusData.state === 'pending') {
+                        ciStatus = 'running';
+                      }
+                    }
+                  }
+                }
+              } catch {}
+
+              try {
+                const reviewsRes = await fetch(`https://api.github.com/repos/${repoName}/pulls/${pr.number}/reviews`, { headers });
+                if (reviewsRes.ok) {
+                  const reviews: any = await reviewsRes.json();
+                  const states = reviews.map((r: any) => r.state);
+                  if (states.includes('CHANGES_REQUESTED')) {
+                    reviewStatus = 'changes_requested';
+                  } else if (states.includes('APPROVED')) {
+                    reviewStatus = 'approved';
+                  }
+                }
+              } catch {}
             }
-          } catch {}
 
-          let reviewStatus: PullRequest['status'] = 'pending';
-          try {
-            const reviewsRes = await fetch(`https://api.github.com/repos/${repo}/pulls/${pr.number}/reviews`, { headers });
-            if (reviewsRes.ok) {
-              const reviews: any = await reviewsRes.json();
-              const states = reviews.map((r: any) => r.state);
-              if (states.includes('CHANGES_REQUESTED')) {
-                reviewStatus = 'changes_requested';
-              } else if (states.includes('APPROVED')) {
-                reviewStatus = 'approved';
-              }
-            }
-          } catch {}
+            return {
+              id: pr.number,
+              title: pr.title,
+              author: pr.user.login,
+              status: reviewStatus,
+              ciStatus: ciStatus,
+              url: pr.html_url,
+              repoName: repoName
+            };
+          }));
+        };
 
-          return {
-            id: pr.number,
-            title: pr.title,
-            author: pr.user.login,
-            status: reviewStatus,
-            ciStatus: ciStatus,
-            url: pr.html_url
-          };
-        }));
+        const formattedMine = await formatPRList(minePulls);
+        const formattedTeam = await formatPRList(teamPulls);
 
-        const mine = formatted.filter(p => p.author === username);
-        const team = formatted.filter(p => p.author !== username);
-        setMyPRs(mine);
-        setTeamPRs(team);
+        setMyPRs(formattedMine);
+        setTeamPRs(formattedTeam);
       } catch (err: any) {
         setError(err.message);
       } finally {
@@ -157,7 +148,8 @@ const PRPlugin: React.FC<PluginProps> = ({ config }) => {
             author: 'me', 
             status: 'approved', 
             ciStatus: 'passing',
-            url: 'https://github.com/portablesheep/swiss/pull/123'
+            url: 'https://github.com/portablesheep/swiss/pull/123',
+            repoName: 'portablesheep/swiss'
           }
         ]);
         setTeamPRs([
@@ -167,7 +159,8 @@ const PRPlugin: React.FC<PluginProps> = ({ config }) => {
             author: 'teammate_a', 
             status: 'pending', 
             ciStatus: 'passing',
-            url: 'https://github.com/portablesheep/swiss/pull/124'
+            url: 'https://github.com/portablesheep/swiss/pull/124',
+            repoName: 'portablesheep/swiss'
           },
           { 
             id: 125, 
@@ -175,7 +168,8 @@ const PRPlugin: React.FC<PluginProps> = ({ config }) => {
             author: 'teammate_b', 
             status: 'changes_requested', 
             ciStatus: 'failing',
-            url: 'https://github.com/portablesheep/swiss/pull/125'
+            url: 'https://github.com/portablesheep/swiss/pull/125',
+            repoName: 'portablesheep/swiss'
           },
           { 
             id: 126, 
@@ -183,7 +177,8 @@ const PRPlugin: React.FC<PluginProps> = ({ config }) => {
             author: 'teammate_c', 
             status: 'pending', 
             ciStatus: 'running',
-            url: 'https://github.com/portablesheep/swiss/pull/126'
+            url: 'https://github.com/portablesheep/swiss/pull/126',
+            repoName: 'portablesheep/swiss'
           }
         ]);
         setLoading(false);
@@ -192,76 +187,32 @@ const PRPlugin: React.FC<PluginProps> = ({ config }) => {
   };
 
   useEffect(() => {
-    const init = async () => {
-      try {
-        const detected = await detectRepo();
-        setRepo(detected);
-      } catch (e) {
-        // Handled via gitError state inside detectRepo
-      }
-    };
-    init();
+    fetchData();
   }, [config]);
-
-  useEffect(() => {
-    if (repo && !gitError) {
-      fetchData();
-    }
-  }, [repo, gitError]);
 
   const allPRs = [...teamPRs, ...myPRs];
 
   useInput(async (input, key) => {
     if (loading) return;
 
-    if (mode === 'VIEW') {
-      if (key.downArrow && allPRs.length > 0) {
-        setSelectedIndex((prev) => Math.min(prev + 1, allPRs.length - 1));
-      }
-      if (key.upArrow && allPRs.length > 0) {
-        setSelectedIndex((prev) => Math.max(prev - 1, 0));
-      }
-      if (input === 'r') {
-        fetchData();
-      }
-      if (input === 'o') {
-        const selectedPR = allPRs[selectedIndex];
-        if (selectedPR) {
-          try {
-            await execa('open', [selectedPR.url]);
-          } catch {}
-        }
-      }
-      if (input === 's') {
-        setInputRepo(repo);
-        setMode('EDIT_REPO');
-      }
-    } else {
-      if (key.escape) {
-        setMode('VIEW');
+    if (key.downArrow && allPRs.length > 0) {
+      setSelectedIndex((prev) => Math.min(prev + 1, allPRs.length - 1));
+    }
+    if (key.upArrow && allPRs.length > 0) {
+      setSelectedIndex((prev) => Math.max(prev - 1, 0));
+    }
+    if (input === 'r') {
+      fetchData();
+    }
+    if (input === 'o') {
+      const selectedPR = allPRs[selectedIndex];
+      if (selectedPR) {
+        try {
+          await execa('open', [selectedPR.url]);
+        } catch {}
       }
     }
   });
-
-  if (gitError) {
-    return (
-      <Layout>
-        <Header title="PR Monitor" />
-        <Card title="Fatal Error" borderColor="red" flexGrow={1}>
-          <Box paddingY={1} flexDirection="column" alignItems="center" justifyContent="center" flexGrow={1}>
-            <StatusBadge status="Error" />
-            <Box marginTop={1}>
-              <Text color="red" bold>Fatal: {gitError}</Text>
-            </Box>
-            <Box marginTop={1}>
-              <Text color="gray">The PR Monitor requires an active Git repository with a configured GitHub remote origin.</Text>
-            </Box>
-          </Box>
-        </Card>
-        <Footer keys={[{ key: 'q', desc: 'Quit' }]} />
-      </Layout>
-    );
-  }
 
   if (loading) {
     return (
@@ -280,7 +231,7 @@ const PRPlugin: React.FC<PluginProps> = ({ config }) => {
       <Box key={pr.id} flexDirection="row" justifyContent="space-between" paddingX={1} backgroundColor={isSelected ? 'blue' : undefined}>
         <Box flexGrow={1}>
           <Text color={isSelected ? 'white' : 'white'} bold={isSelected}>
-            {isSelected ? '▶ ' : '  '}#{pr.id}: {pr.title}
+            {isSelected ? '▶ ' : '  '}{pr.repoName ? `[${pr.repoName}] ` : ''}#{pr.id}: {pr.title}
           </Text>
           <Text color={isSelected ? 'cyan' : 'gray'}> @{pr.author}</Text>
         </Box>
@@ -295,75 +246,54 @@ const PRPlugin: React.FC<PluginProps> = ({ config }) => {
 
   return (
     <Layout>
-      <Header title={`PR Monitor [${isLive ? 'LIVE' : 'MOCK'}][Repo: ${repo}]`} />
+      <Header title={`PR Monitor [${isLive ? 'LIVE' : 'MOCK'}]`} />
       
-      {mode === 'EDIT_REPO' ? (
-        <Box flexDirection="column" width="100%">
-          <TextInputField
-            label="Swap Repository (owner/repo)"
-            value={inputRepo}
-            onChange={setInputRepo}
-            onSubmit={(val) => {
-              if (val.trim()) {
-                setRepo(val.trim());
-              }
-              setMode('VIEW');
-            }}
-            placeholder="e.g. facebook/react"
-          />
-          <Footer keys={[{ key: 'Enter', desc: 'Apply Repository' }, { key: 'Esc', desc: 'Cancel' }]} />
+      {!isLive && (
+        <Box marginBottom={1} paddingX={1} borderStyle="classic" borderColor="yellow">
+          <Text color="yellow" bold>💡 Running in offline mock mode. Set "pr.githubToken" via "swiss config" to connect live!</Text>
         </Box>
-      ) : (
-        <>
-          {!isLive && (
-            <Box marginBottom={1} paddingX={1} borderStyle="classic" borderColor="yellow">
-              <Text color="yellow" bold>💡 Running in offline mock mode. Set "pr.githubToken" via "swiss config" to connect live!</Text>
-            </Box>
-          )}
-
-          {error && (
-            <Box marginBottom={1} paddingX={1} borderStyle="single" borderColor="red">
-              <Text color="red">Error: {error}</Text>
-            </Box>
-          )}
-
-          <Box flexDirection="row" flexGrow={1}>
-            {/* Pending Review Section */}
-            <Box width="50%" marginRight={1}>
-              <Card title={`Pending Review (${teamPRs.length})`} borderColor="yellow" width="100%">
-                <ScrollableList 
-                  items={teamPRs}
-                  selectedIndex={selectedIndex < teamPRs.length ? selectedIndex : -1}
-                  renderItem={(pr, isSelected) => renderPRLine(pr, teamPRs.indexOf(pr), 0)}
-                  maxVisible={maxVisibleList}
-                />
-              </Card>
-            </Box>
-
-            {/* Your Pull Requests Section */}
-            <Box width="50%">
-              <Card title={`Your PRs (${myPRs.length})`} borderColor="green" width="100%">
-                <ScrollableList 
-                  items={myPRs}
-                  selectedIndex={selectedIndex >= teamPRs.length ? selectedIndex - teamPRs.length : -1}
-                  renderItem={(pr, isSelected) => renderPRLine(pr, myPRs.indexOf(pr), teamPRs.length)}
-                  maxVisible={maxVisibleList}
-                />
-              </Card>
-            </Box>
-          </Box>
-
-          <Footer 
-            keys={[
-              { key: '↑/↓', desc: 'Navigate PRs' },
-              { key: 'o', desc: 'Open PR' },
-              { key: 's', desc: 'Swap Repo' },
-              { key: 'r', desc: 'Refresh' },
-              { key: 'q', desc: 'Quit' }
-            ]}
-          />
-        </>
       )}
+
+      {error && (
+        <Box marginBottom={1} paddingX={1} borderStyle="single" borderColor="red">
+          <Text color="red">Error: {error}</Text>
+        </Box>
+      )}
+
+      <Box flexDirection="row" flexGrow={1}>
+        {/* Pending Review Section */}
+        <Box width="50%" marginRight={1}>
+          <Card title={`Pending Review (${teamPRs.length})`} borderColor="yellow" width="100%">
+            <ScrollableList 
+              items={teamPRs}
+              selectedIndex={selectedIndex < teamPRs.length ? selectedIndex : -1}
+              renderItem={(pr, isSelected) => renderPRLine(pr, teamPRs.indexOf(pr), 0)}
+              maxVisible={maxVisibleList}
+            />
+          </Card>
+        </Box>
+
+        {/* Your Pull Requests Section */}
+        <Box width="50%">
+          <Card title={`Your PRs (${myPRs.length})`} borderColor="green" width="100%">
+            <ScrollableList 
+              items={myPRs}
+              selectedIndex={selectedIndex >= teamPRs.length ? selectedIndex - teamPRs.length : -1}
+              renderItem={(pr, isSelected) => renderPRLine(pr, myPRs.indexOf(pr), teamPRs.length)}
+              maxVisible={maxVisibleList}
+            />
+          </Card>
+        </Box>
+      </Box>
+
+      <Footer 
+        keys={[
+          { key: '↑/↓', desc: 'Navigate PRs' },
+          { key: 'o', desc: 'Open PR' },
+          { key: 'r', desc: 'Refresh' },
+          { key: 'q', desc: 'Quit' }
+        ]}
+      />
     </Layout>
   );
 };

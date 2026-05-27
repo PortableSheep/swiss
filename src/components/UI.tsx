@@ -1,6 +1,32 @@
-import React, { useState, useEffect } from 'react';
-import { Box, Text } from 'ink';
+import React, { useState, useEffect, createContext, useContext } from 'react';
+import { Box, Text, useInput } from 'ink';
 import TextInput from 'ink-text-input';
+
+export const HeaderVisibilityContext = createContext<{
+  visible: boolean;
+  setVisible: (visible: boolean) => void;
+}>({
+  visible: true,
+  setVisible: () => {},
+});
+
+export const useHeaderVisibility = () => useContext(HeaderVisibilityContext);
+
+export const HeaderVisibilityProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
+  const [visible, setVisible] = useState(true);
+
+  useInput((input, key) => {
+    if (key.ctrl && input === 'h') {
+      setVisible(v => !v);
+    }
+  });
+
+  return (
+    <HeaderVisibilityContext.Provider value={{ visible, setVisible }}>
+      {children}
+    </HeaderVisibilityContext.Provider>
+  );
+};
 
 export const useTerminalSize = () => {
   const [size, setSize] = useState({
@@ -24,13 +50,18 @@ export const useTerminalSize = () => {
   return size;
 };
 
-export const Header: React.FC<{ title: string }> = ({ title }) => (
-  <Box borderStyle="round" borderColor="cyan" paddingX={1} marginBottom={1}>
-    <Text bold color="white">
-      SWISS 🛠️ <Text color="cyan">{title.toUpperCase()}</Text>
-    </Text>
-  </Box>
-);
+export const Header: React.FC<{ title: string }> = ({ title }) => {
+  const { visible } = useContext(HeaderVisibilityContext);
+  if (!visible) return null;
+
+  return (
+    <Box borderStyle="round" borderColor="cyan" paddingX={1} marginBottom={1}>
+      <Text bold color="white">
+        SWISS 🛠️ <Text color="cyan">{title.toUpperCase()}</Text>
+      </Text>
+    </Box>
+  );
+};
 
 export const Layout: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const size = useTerminalSize();
@@ -140,17 +171,20 @@ export const ScrollableList: React.FC<{
   );
 };
 
-export const Footer: React.FC<{ keys: { key: string; desc: string }[] }> = ({ keys }) => (
-  <Box marginTop={1} flexDirection="row" flexWrap="wrap">
-    {keys.map((k, i) => (
-      <Box key={i} marginRight={2}>
-        <Text color="gray">
-          [<Text color="white" bold>{k.key}</Text>] {k.desc}
-        </Text>
-      </Box>
-    ))}
-  </Box>
-);
+export const Footer: React.FC<{ keys: { key: string; desc: string }[] }> = ({ keys }) => {
+  const allKeys = [...keys, { key: 'Ctrl+H', desc: 'Toggle Header' }];
+  return (
+    <Box marginTop={1} flexDirection="row" flexWrap="wrap">
+      {allKeys.map((k, i) => (
+        <Box key={i} marginRight={2}>
+          <Text color="gray">
+            [<Text color="white" bold>{k.key}</Text>] {k.desc}
+          </Text>
+        </Box>
+      ))}
+    </Box>
+  );
+};
 
 export const StatusBadge: React.FC<{ status: string; type?: 'success' | 'warning' | 'error' | 'info' }> = ({ status, type }) => {
   let color = 'white';

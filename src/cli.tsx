@@ -5,7 +5,7 @@ import { Command } from 'commander';
 import fs from 'fs';
 import path from 'path';
 import { PluginLoader } from './core/PluginLoader.js';
-import { Header, Layout } from './components/UI.js';
+import { Header, Layout, HeaderVisibilityProvider } from './components/UI.js';
 import { ConfigManager } from './core/ConfigManager.js';
 
 const program = new Command();
@@ -114,12 +114,16 @@ export default ${newPluginName.charAt(0).toUpperCase() + newPluginName.slice(1)}
         }
       });
 
-      return React.createElement(plugin.default, { 
-        args: pluginArgs || [], 
-        options,
-        config,
-        suppressQuit: setIsQuitSuppressed
-      });
+      return (
+        <HeaderVisibilityProvider>
+          {React.createElement(plugin.default, { 
+            args: pluginArgs || [], 
+            options,
+            config,
+            suppressQuit: setIsQuitSuppressed
+          })}
+        </HeaderVisibilityProvider>
+      );
     };
 
     render(<App />);
